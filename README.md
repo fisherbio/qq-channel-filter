@@ -4,7 +4,7 @@
 
 **专为 QQ 频道网页版 (`pd.qq.com`) 打造的现代化、无缝瀑布流内容过滤与净化油猴脚本**
 
-[![GitHub release](https://img.shields.io/badge/Release-v1.5.0-blue.svg?style=flat-square)](https://github.com/fisherbio/qq-channel-filter)
+[![GitHub release](https://img.shields.io/badge/Release-v1.6.0-blue.svg?style=flat-square)](https://github.com/fisherbio/qq-channel-filter)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg?style=flat-square)](https://opensource.org/licenses/MIT)
 [![Tampermonkey](https://img.shields.io/badge/Tampermonkey-Supported-green.svg?style=flat-square)](https://www.tampermonkey.net/)
 [![Vue 3](https://img.shields.io/badge/Vue.js-3.x%20%2B%20Pinia-4FC08D.svg?style=flat-square&logo=vuedotjs)](https://vuejs.org/)
@@ -33,6 +33,11 @@ QQ 频道网页版在“全部”、“最新”、“最热”、“热门”�
 - 深度直通 Nuxt 3 运行时底层，实时监听与响应式同步 `mainFeedsStore.items` 与 `topFeeds`。
 - 触发底层 `vue-recycle-scroller` 重新计算剩余有效帖子的绝对布局坐标。
 - **被屏蔽的卡片彻底移出流水线，后续帖子平滑紧凑顶上，完全不留任何空白坑洞！**
+
+### 2. 🔄 缺额按需自动回补（Auto-Replenish & Backfill）
+- **解决屏蔽后帖子总数缩减问题**：当屏蔽特定板块或用户导致当前屏幕有效帖子骤减时，内置自适应健康水位回补引擎。
+- **平滑自动向后拉取**：监测到当前有效帖子低于安全保有量（`SAFE_MIN_ITEMS = 15` 条或高度不足）时，静默调用底层 `fetchFeeds()` 向后端分页获取新帖子自动补满缺额，无需用户手动反复拉扯滚动条。
+- **五重边界防频控**：内置并发互斥锁、350ms 拟人阶梯防抖、单轮 3 次预算熔断、服务器到头拦截与 15 秒异常熔断冷静期，100% 杜绝死循环与频控风险。
 
 ### 2. 👤 发帖人一键拉黑（作者黑名单）
 - **卡片快捷拉黑**：卡片作者昵称旁自动注入高辨识度实体胶囊按钮 `【 👤🚫 [作者名] 】`。

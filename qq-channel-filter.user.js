@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         QQ频道板块与关键词屏蔽器 (QQ Guild Board & Keyword Filter)
 // @namespace    https://github.com/fisherbio/qq-channel-filter
-// @version      1.5.0
-// @description  在QQ频道网页版(pd.qq.com)的“全部”、“最新”、“最热”、“热门”等混合帖子流中屏蔽指定板块、关键词或发帖人，支持Pinia响应式无缝排版（剔除空白占位自动补全）、事件捕获级快速屏蔽按钮、极速Toast撤销提示与可视化设置面板。
+// @version      1.6.0
+// @description  在QQ频道网页版(pd.qq.com)的“全部”、“最新”、“最热”、“热门”等混合帖子流中屏蔽指定板块、关键词或发帖人，支持Pinia响应式无缝排版（自动回补缺额帖子）、事件捕获级快速屏蔽按钮、极速Toast撤销提示与可视化设置面板。
 // @author       fisherbio
 // @match        https://pd.qq.com/*
 // @homepage     https://github.com/fisherbio/qq-channel-filter
@@ -104,6 +104,9 @@
         storage.set('blockedKeywords', config.blockedKeywords);
         storage.set('blockedUsers', config.blockedUsers);
         storage.set('boardMap', config.boardMap);
+        if (typeof storeManager !== 'undefined' && storeManager.replenishBudget !== undefined) {
+            storeManager.replenishBudget = storeManager.MAX_BUDGET;
+        }
     }
 
     // Reload config from storage
@@ -272,17 +275,27 @@
     }
 
     // =========================================================================
-    // Pinia Store Manager: Seamless Reactive Layout Synchronization
+    // Pinia Store Manager: Seamless Reactive Layout Synchronization & Auto-Replenish
     // =========================================================================
     const storeManager = {
         pinia: null,
         mainFeedsStore: null,
         mainStore: null,
+        channelStore: null,
         rawFeedsMap: new Map(),     // feedId -> rawFeedItem
         rawFeedsList: [],           // Preserves original order
         rawTopFeedsList: [],        // Preserves original top feeds
         isFiltering: false,
         initialized: false,
+
+        // --- Backfill & Auto-Replenish Controls ---
+        isReplenishing: false,
+        replenishBudget: 3,         // Max consecutive automatic backfill requests
+        MAX_BUDGET: 3,
+        SAFE_MIN_ITEMS: 15,         // Safe watermark threshold to fill viewport
+        lastErrorTime: 0,
+        COOL_DOWN_MS: 15000,        // Circuit breaker cool-down (15s)
+        replenishTimer: null,
 
         getPinia() {
             const win = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
@@ -302,6 +315,7 @@
             this.pinia = pinia;
             this.mainFeedsStore = pinia._s.get('mainFeedsStore');
             this.mainStore = pinia._s.get('mainStore');
+            this.channelStore = pinia._s.get('channelStore');
 
             if (!this.mainFeedsStore) return;
             this.initialized = true;
@@ -318,7 +332,7 @@
 
             // Hook actions ($onAction) for infinite scroll & refreshes
             if (this.mainFeedsStore.$onAction) {
-                this.mainFeedsStore.$onAction(({ name, after }) => {
+                this.mainFeedsStore.$onAction(({ name, after, onError }) => {
                     if (['fetchFeeds', 'insertFeedItem', 'resetFeedsData'].includes(name)) {
                         after(() => {
                             setTimeout(() => {
@@ -327,8 +341,30 @@
                             }, 30);
                         });
                     }
+                    if (onError) {
+                        onError((err) => {
+                            console.warn('[QQ-Filter] fetchFeeds encountered error, entering cooldown.', err);
+                            this.lastErrorTime = Date.now();
+                            this.isReplenishing = false;
+                        });
+                    }
                 });
             }
+
+            // Hook user scroll to refresh replenish budget
+            const bindScrollListener = () => {
+                const scroller = document.getElementById('scrollableDiv') || document.querySelector('.game-guild-main__waterfalls-scroller');
+                if (scroller && !scroller._qqFilterBound) {
+                    scroller._qqFilterBound = true;
+                    scroller.addEventListener('scroll', () => {
+                        if (scroller.scrollTop + scroller.clientHeight >= scroller.scrollHeight - 300) {
+                            this.replenishBudget = this.MAX_BUDGET;
+                        }
+                    }, { passive: true });
+                }
+            };
+            bindScrollListener();
+            setTimeout(bindScrollListener, 1000);
 
             // Hook tab switching
             if (this.mainStore && this.mainStore.$subscribe) {
@@ -336,15 +372,17 @@
                     this.rawFeedsMap.clear();
                     this.rawFeedsList = [];
                     this.rawTopFeedsList = [];
+                    this.replenishBudget = this.MAX_BUDGET;
                     setTimeout(() => {
                         this.ingestFeeds();
                         this.syncFeeds();
+                        bindScrollListener();
                     }, 60);
                 });
             }
 
             this.syncFeeds();
-            console.log('[QQ-Channel-Filter] Pinia store reactive synchronization active.');
+            console.log('[QQ-Channel-Filter] Pinia store reactive synchronization & auto-replenish active.');
         },
 
         ingestFeeds() {
@@ -359,6 +397,7 @@
                     this.rawFeedsMap.clear();
                     this.rawFeedsList = [];
                     this.rawTopFeedsList = [];
+                    this.replenishBudget = this.MAX_BUDGET;
                 }
             }
 
@@ -472,10 +511,99 @@
                 stats.keywordHidden = kwCount;
                 stats.userHidden = userCount;
                 updateStatsDisplay();
+
+                // 4. Trigger Auto-Replenish / Backfill evaluation
+                this.checkAndReplenish();
             } catch (err) {
                 console.error('[QQ-Channel-Filter] syncFeeds error:', err);
             } finally {
                 this.isFiltering = false;
+            }
+        },
+
+        // --- Backfill Evaluation & Dispatcher ---
+        checkAndReplenish() {
+            if (!this.mainFeedsStore) return;
+            if (!config.enabled) return;
+            if (config.onlyInMixedFeed && !isCurrentMixedFeed()) return;
+
+            // Guard 1: Concurrency and active request check
+            if (this.isReplenishing || this.mainFeedsStore.isRequesting || this.mainFeedsStore.isLoading) return;
+
+            // Guard 2: End-of-feed check (server has no more items)
+            if (this.mainFeedsStore.isFinish === 1 || this.mainFeedsStore.isFinish === true) {
+                return;
+            }
+
+            // Guard 3: Circuit breaker cooldown check
+            if (Date.now() - this.lastErrorTime < this.COOL_DOWN_MS) {
+                return;
+            }
+
+            // Guard 4: Budget exhaustion check
+            if (this.replenishBudget <= 0) {
+                return;
+            }
+
+            // Check if replenish is actually needed
+            const curItemsCount = this.mainFeedsStore.items?.length || 0;
+            const scroller = document.getElementById('scrollableDiv') || document.querySelector('.game-guild-main__waterfalls-scroller');
+            const isUnderflowByCount = curItemsCount < this.SAFE_MIN_ITEMS;
+            const isUnderflowByHeight = scroller && (scroller.scrollHeight <= scroller.clientHeight * 1.5);
+
+            if (!isUnderflowByCount && !isUnderflowByHeight) {
+                return; // Healthy watermark reached
+            }
+
+            // Debounce & dispatch
+            if (this.replenishTimer) clearTimeout(this.replenishTimer);
+            this.replenishTimer = setTimeout(() => {
+                this.executeReplenish();
+            }, 350); // 350ms gentle pacing to avoid burst rate-limiting
+        },
+
+        async executeReplenish() {
+            if (this.isReplenishing || !this.mainFeedsStore) return;
+            if (this.mainFeedsStore.isRequesting || this.mainFeedsStore.isLoading) return;
+            if (this.replenishBudget <= 0) return;
+
+            this.isReplenishing = true;
+            this.replenishBudget--;
+
+            // Dynamically resolve context arguments
+            const win = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
+            const route = win.useNuxtApp?.()._route;
+            const guildNum = this.channelStore?.currentChannelInfo?.guild_number 
+                          || route?.params?.guildNum 
+                          || '';
+            const selectedTab = this.mainStore?.currentTab 
+                             || route?.query?.subc 
+                             || '';
+
+            try {
+                console.log(`[QQ-Filter] Auto-replenishing feeds (Remaining budget: ${this.replenishBudget}, Current visible: ${this.mainFeedsStore.items?.length || 0})...`);
+                const params = { isFirstPage: false };
+                if (selectedTab) params.selectedTab = selectedTab;
+                if (guildNum) params.guildNum = guildNum;
+
+                if (typeof this.mainFeedsStore.fetchFeeds === 'function') {
+                    const res = this.mainFeedsStore.fetchFeeds(params);
+                    if (res && typeof res.then === 'function') {
+                        await res;
+                    }
+                } else {
+                    // Fallback: trigger native infinite scroller
+                    const scroller = document.getElementById('scrollableDiv') || document.querySelector('.game-guild-main__waterfalls-scroller');
+                    if (scroller) {
+                        scroller.scrollTop = scroller.scrollHeight;
+                        scroller.dispatchEvent(new Event('scroll', { bubbles: true }));
+                    }
+                }
+            } catch (e) {
+                console.warn('[QQ-Filter] Auto-replenish failed:', e);
+                this.lastErrorTime = Date.now();
+            } finally {
+                this.isReplenishing = false;
             }
         }
     };
