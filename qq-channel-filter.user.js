@@ -1322,7 +1322,7 @@
             chip.onclick = () => {
                 const board = chip.getAttribute('data-board');
                 if (config.blockedBoards.includes(board)) {
-                    config.blockedBoards.push(board);
+                    config.blockedBoards = config.blockedBoards.filter(b => b !== board);
                 } else {
                     config.blockedBoards.push(board);
                 }
